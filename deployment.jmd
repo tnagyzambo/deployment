@@ -1,0 +1,180 @@
+---
+title: "Design of Ball-lock Deployment Mechanism"
+author: "Thomas Nagy Zambo, Mateusz Lentner, Nathaniel P. Stebbins Dahl"
+date: "2023/02/09"
+abstract: "Test abstract of notable information. Lorem Ipsum is simply dummy text of the printing and type- setting industry. Lorem Ipsum has been the industry’s standard dummy text ever since the 1500s, when an unknown printer took a galley of type and scrambled it to make a type specimen book. It has survived not only five centuries, but also the leap into electronic typesetting, remaining essentially unchanged. It was popularised"
+weave_options:
+  doctype: md2pdf
+  out_path: pdf
+---
+
+# Introduction
+
+# Design
+
+```julia; echo=false; fig_cap="Dyanmic Pressure at Deployment Sensitivity"
+using CSV
+using DataFrames
+using LaTeXStrings
+using Printf
+using Plots; pythonplot()
+
+# Search parameters
+max_q_accel = (0.0, 0.0) # (m/s^2, mBar)
+max_q_time = (0.0, 0.0) # (s, mBar)
+tol_accel = 0.25 # +/- m/s^2
+tol_time = 4 # +/- s
+
+# Setup plot
+p1 = plot(layout=(2, 1))
+xlabel!("Vertical Acceleration Relative to Apogee (m/s²)", subplot=1)
+xlabel!("Time to Apogee (s)", subplot=2)
+ylabel!("Q (mBar)")
+xlims!((-2, 2), subplot=1)
+
+# Iterate through all trajectories
+for i in 1:8
+  path = @sprintf("../data/sims/deploymentSim%i.csv", i)
+  t_apogee = 0.0
+
+  # Find apogee time
+  open(path) do file
+    for line in eachline(file)
+      rgx_apogee = r"(?:# Event APOGEE occurred at t=)([\d\.]+)"
+      rgx_match = match(rgx_apogee, line)
+
+      if rgx_match != nothing
+        t_apogee = parse(Float64, rgx_match.captures[1])
+        break
+      end
+    end
+  end
+  
+  # Normalize trajectory around apogee and plot
+  trajectory = DataFrame(CSV.File(path, delim=",", comment="#"))
+  rename!(trajectory, [:time, :altitude, :vertical_acceleration, :dynamic_pressure])
+  transform!(trajectory, :vertical_acceleration => (a -> a .+ 9.81), renamecols=false)
+  transform!(trajectory, :time => (t -> t .- t_apogee), renamecols=false)
+  filter!(row -> (-10 <= row.time && row.time <= 10), trajectory)
+
+  plot!(trajectory.vertical_acceleration, trajectory.dynamic_pressure, label="", subplot=1)
+  plot!(trajectory.time, trajectory.dynamic_pressure, label="", subplot=2)
+
+  # Find max Q
+  sort!(trajectory, :dynamic_pressure, rev=true)
+  trajectory_tol_accel = filter(row -> (-tol_accel <= row.vertical_acceleration && row.vertical_acceleration <= tol_accel), trajectory)
+  trajectory_tol_time = filter(row -> (-tol_time <= row.time && row.time <= tol_time), trajectory)
+
+  if trajectory_tol_accel[1, :dynamic_pressure] > max_q_accel[2]
+    global max_q_accel = (trajectory_tol_accel[1, :vertical_acceleration], trajectory_tol_accel[1, :dynamic_pressure])
+  end
+
+  if trajectory_tol_time[1, :dynamic_pressure] > max_q_time[2]
+    global max_q_time = (trajectory_tol_time[1, :time], trajectory_tol_time[1, :dynamic_pressure])
+  end
+end
+
+# Q to F
+r_rocket = 76E-3 # Radius of rocket body (m)
+q_deployment = max(max_q_accel[2], max_q_time[2]) * 100 # Worst case dynamic pressure at deployment (Pa)
+f_deployment = q_deployment * π * r_rocket^2 # Worst case force required for deployment (N) 
+
+# Plot
+vline!([-tol_accel, tol_accel]; color=:black, label="", subplot=1)
+annotate!(0, 90, text(L"\Delta a_a", 10); subplot=1)
+quiver!([-0.1], [90], quiver=([-tol_accel + 0.1], [0]), color=:black, subplot=1)
+quiver!([0.1], [90], quiver=([tol_accel - 0.1], [0]), color=:black, subplot=1)
+scatter!(max_q_accel; label=L"Q_{max_a}", subplot=1)
+
+vline!([-tol_time, tol_time]; color=:black, label="", subplot=2)
+annotate!(0, 90, text(L"\Delta t_a", 10); subplot=2)
+quiver!([-0.5], [90], quiver=([-tol_time + 0.5], [0]), color=:black, subplot=2)
+quiver!([0.5], [90], quiver=([tol_time - 0.5], [0]), color=:black, subplot=2)
+scatter!(max_q_time; label=L"Q_{max_t}", subplot=2)
+```
+
+In order to size the components of the ball-lock mechanism, an estimate of the aerodynamic forces experienced at deployment was found by analyzing a number of possible trajectories of the Dodo rocket at various launch angles and motor performances. All trajectories were normalized around apogee and the maximum dynamic pressure was found given a tolerance on the flight computers ability to detect apogee. The main flight computer will trigger deployment from accelerometer data. A tolerance of $\pm\SI{`j @printf("%.1f", tol_accel)`}{m/s^2}$ on apogee detection is assumed on the performance of the accelerometer sensor. The EuRoC mandated redundant flight computer will trigger deployment via a timer set at launch. A deployment window of $\pm\SI{`j @printf("%.1f", tol_time)`}{s}$ is assumed based on the accuracy of our flight simulations and variations in rocket performance. These assumptions yield a maximum expect aerodynamic force of $\SI{`j @printf("%.2f", f_deployment)`}{N}$ at deployment to be found in the case of deployment by the secondary flight computer.
+
+```julia
+function sim_deployment(n::Int64, k::Real, l1::Real, l2::Real, m::Real, f_d::Real, dt::Real, N::Int64)
+  f_g = m * 9.81
+  x = zeros(N, 2)
+  y = zeros(N, 1)
+  t = zeros(N, 1)
+
+  x[1, :] = [l2 - l1; 0]
+  
+  A_1 = [0 1; (n * -k / m) 0]
+  A_2 = [0 1; 0 0]
+  B = [0; ((-f_g - f_d) / m)]
+  C = [1 0]
+
+  for i in 2:N 
+    if x[i - 1, 1] < 0.0
+      x_dot = A_1 * x[i - 1, :] + B
+    else
+      x_dot = A_2 * x[i - 1, :] + B
+    end
+
+    x[i, :] = x[i - 1, :] + x_dot * dt
+    y[i, :] = C * x[i, :]
+    t[i, :] = t[i - 1, :] .+ dt
+  end
+
+  return (t, x)
+end
+```
+
+```julia; echo=false; fig_cap="Spring Selection"
+# Import csv of possible sping selections
+df_springs = DataFrame(CSV.File("../data/springs.csv", header=1, delim=",", comment="#"))
+
+# Convert to SI
+transform!(df_springs, :outside_diameter => x -> x .* 1E-3, renamecols=false)
+transform!(df_springs, :hole_diameter => x -> x .* 1E-3, renamecols=false)
+transform!(df_springs, :rod_diameter => x -> x .* 1E-3, renamecols=false)
+transform!(df_springs, :free_length => x -> x .* 1E-3, renamecols=false)
+transform!(df_springs, :rate => x -> x .* 1E3, renamecols=false)
+transform!(df_springs, :solid_height => x -> x .* 1E-3, renamecols=false)
+transform!(df_springs, :wire_diameter => x -> x .* 1E-3, renamecols=false)
+
+# Design space constraints
+n_spring = 6 # Number of springs
+l2_spring = 10E-3 # Compressed spring length (m)
+f_min_deployment = f_deployment * 2 # Minimum nosecone ejection force (N)
+m_nosecone = 2.0 # (kg)
+
+# Apply constraints
+filter!(row -> (row.solid_height <= l2_spring), df_springs)
+
+# Calcuate ejection properties
+transform!(df_springs, [:free_length, :rate] => ((l1, k) -> n_spring .* k .* (l1 .- l2_spring)) => :force) # Force to comperess n springs
+
+# Filter unsuitable springs
+filter!(row -> (row.force >= f_min_deployment), df_springs)
+
+# Selected spring
+spring_name = "LCM080C 09 S"
+spring = filter(row -> (row.part_number == spring_name), df_springs)
+
+# Plot
+p2 = scatter(df_springs.hole_diameter .* 1E3, df_springs.free_length .* 1E3, legend=false)
+quiver!(spring.hole_diameter .* 1E3 .+ 0.3, spring.free_length .* 1E3 .+ 2, quiver=([-0.28], [-1.8]), color=:black)
+annotate!(spring.hole_diameter .* 1E3 .+ 0.3, spring.free_length .* 1E3 .+ 2.5, text(spring_name, 10))
+xlabel!("Hole Diameter (mm)")
+ylabel!("Free Length (mm)")
+
+n_spring = 8
+(t, x) = sim_deployment(n_spring, spring[1, :rate], spring[1, :free_length], l2_spring, m_nosecone, f_deployment, 0.001, 50)
+
+print(spring.rate)
+print(spring.free_length)
+
+plot(t, x[:, 1])
+plot!(t, x[:, 2] .* 0.001)
+```
+
+With a couple loose constraints on the physical dimensions and layout of the deployment mechanism a list of 162 suitable springs from the Manufacturer LeeSpring was obtained. In order to produce a uniform ejection force around the circumference of the deployment mechanism, `j n_spring` springs in were considered for the final assembly. A compressed length of $\SI{`j @printf("%.1f", l2_spring * 1E3)`}{mm}$ was considered as the smallest realizable compressed length due to constraints imposed by the ball lock geometry. These constraints further filtered the list of suitable spring to those that could meet the required deployment force with a minimum safety factor of 2. The smallest spring that met these requirements was the `j spring_name` spring. Note that a smaller hole diameter was considered more impactful to the mass of the overall assembly compared to the uncompressed length of the spring.
+
+
+
